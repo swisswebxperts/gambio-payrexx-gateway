@@ -115,7 +115,7 @@ class OrderService
                 }
                 break;
             default:
-                throw new \Exception($status . ' case not implemented.');
+                throw new \DomainException($status . ' case not implemented.');
         }
 
         if ((int)$gxOrder->getStatusId() === (int)$newStatusId) {
@@ -123,7 +123,7 @@ class OrderService
         }
         // check the status transition to change.
         if (!$this->_allowedStatusTransition($gxOrder->getStatusId(), $newStatusId)) {
-            throw new \Exception('Status transition not allowed');
+            throw new \DomainException('Status transition not allowed');
         }
         $this->updateOrderStatus($orderId, $newStatusId, $status);
     }

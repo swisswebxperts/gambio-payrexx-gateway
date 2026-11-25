@@ -15,6 +15,8 @@
  */
 declare(strict_types=1);
 
+use Payrexx\Models\Response\Transaction;
+use Payrexx\PayrexxPaymentGateway\Classes\Service\OrderConfirmation;
 use Payrexx\PayrexxPaymentGateway\Classes\Service\OrderService;
 use Payrexx\PayrexxPaymentGateway\Classes\Service\PayrexxApiService;
 
@@ -78,44 +80,55 @@ class PayrexxWebhookController extends HttpViewController
     public function actionDefault()
     {
         try {
-            $data = $_POST;
-            if (empty($data)) {
-                throw new \Exception('Payrexx Webhook Data incomplete');
+            $data = $_POST ?: json_decode(file_get_contents('php://input'), true);
+            $transaction = $data['transaction'] ?? [];
+            $id = filter_var($transaction['id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            $orderId = filter_var($transaction['referenceId'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if (!$id || !$orderId || empty($transaction['status'])) {
+                echo 'Incomplete transaction';
+                exit();
             }
-            $transaction = $data['transaction'];
-            $orderId = (int) $transaction['referenceId'];
 
-            if (!$orderId || !$transaction['status'] || !$transaction['id']) {
-                throw new \Exception('Payrexx Webhook Data incomplete');
+            $verified = $this->payrexxApiService->getTransactionById($id);
+            if (!$verified) {
+                throw new RuntimeException('Transaction lookup failed');
+            }
+            if ((string)$verified->getReferenceId() !== (string)$orderId) {
+                echo 'Transaction does not belong to this order';
+                exit();
+            }
+
+            $status = $verified->getStatus();
+            if ($status !== $transaction['status']) {
+                echo 'Ignored notification for a different transaction status';
+                exit();
             }
 
             $order = new order($orderId);
-            if (!$order) {
-                throw new \Exception('Malicious request');
+            $method = $order->info['payment_method'] ?? '';
+            if ($method !== 'payrexx' && strpos($method, 'payrexx_') !== 0) {
+                echo 'Order does not use Payrexx';
+                exit();
             }
 
-            $payrexxTransaction = $this->payrexxApiService->getTransactionById((int)$transaction['id']);
-            if (!$payrexxTransaction) {
-                // Only a failed lookup is worth a retry: a non-2xx response makes Payrexx send the webhook again,
-                // while every other error stays 200 to avoid retries and webhook error mails to the merchant
-                http_response_code(500);
-                throw new \Exception('Transaction could not be loaded from Payrexx');
+            $invoice = in_array($status, [Transaction::REFUNDED, Transaction::PARTIALLY_REFUNDED], true)
+                ? ($verified->getInvoice() ?? []) : [];
+            $this->orderService->handleTransactionStatus($orderId, $status, $invoice);
+            if ($status === Transaction::CONFIRMED) {
+                $twint = $method === 'payrexx_twint'
+                    || ($method === 'payrexx' && ($verified->getPayment()['brand'] ?? '') === 'twint');
+                if ($twint) {
+                    OrderConfirmation::sendOnce($orderId);
+                }
             }
-            // The posted referenceId is untrusted, so a valid transaction of another order must not update this one
-            if ((int)$payrexxTransaction->getReferenceId() !== $orderId) {
-                throw new \Exception('Transaction does not belong to this order');
-            }
-            if ($payrexxTransaction->getStatus() !== $transaction['status']) {
-                throw new \Exception('Fraudulent transaction status');
-            }
-            $this->orderService->handleTransactionStatus(
-                $orderId,
-                $transaction['status'],
-                $transaction['invoice'] ?? []
-            );
             echo 'Success: Webhook processed!';
-        } catch (\Throwable $e) {
-            echo 'Error: ' . $e->getMessage();
+        } catch (DomainException $e) {
+            // Retrying an unsupported or obsolete status cannot advance the order.
+            echo 'Ignored transaction status';
+        } catch (Throwable $e) {
+            http_response_code(500);
+            \Gambio\Core\Logging\logger('payrexx')->error('Webhook failed for order ' . ($orderId ?? 0), ['exception' => $e]);
+            echo 'Webhook processing failed';
         }
         exit();
     }
